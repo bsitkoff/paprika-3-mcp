@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -83,14 +84,18 @@ func NewClient(username, password, version string, logger *slog.Logger) (*Client
 	}
 
 	return &Client{
-		client: client,
-		logger: l,
+		client:   client,
+		logger:   l,
+		username: username,
+		password: password,
 	}, nil
 }
 
 type Client struct {
-	client *http.Client
-	logger *slog.Logger
+	client   *http.Client
+	logger   *slog.Logger
+	username string
+	password string
 }
 
 type loginResponse struct {
@@ -186,6 +191,39 @@ func (c *Client) ListRecipes(ctx context.Context) (*RecipeList, error) {
 
 	c.logger.Info("found recipes", "count", len(recipeList.Result))
 	return &recipeList, nil
+}
+
+type MealPlan struct {
+	UID       string `json:"uid"`
+	RecipeUID string `json:"recipe_uid"`
+	Date      string `json:"date"`
+	Type      int    `json:"type"`
+	Name      string `json:"name"`
+	OrderFlag int    `json:"order_flag"`
+	Deleted   bool   `json:"deleted"`
+}
+
+type MealPlanResponse struct {
+	Result []MealPlan `json:"result"`
+}
+
+type GroceryItem struct {
+	UID         string `json:"uid"`
+	RecipeUID   string `json:"recipe_uid"`
+	Name        string `json:"name"`
+	OrderFlag   int    `json:"order_flag"`
+	Purchased   bool   `json:"purchased"`
+	Aisle       string `json:"aisle"`
+	Ingredient  string `json:"ingredient"`
+	Recipe      string `json:"recipe"`
+	Instruction string `json:"instruction"`
+	Quantity    string `json:"quantity"`
+	AisleUID    string `json:"aisle_uid"`
+	ListUID     string `json:"list_uid"`
+}
+
+type GroceryResponse struct {
+	Result []GroceryItem `json:"result"`
 }
 
 type Recipe struct {
@@ -523,6 +561,285 @@ func isErrorResponse(body []byte) error {
 	if errResp.Error.Message != "" || errResp.Error.Code != 0 {
 		return fmt.Errorf("error: %s (code: %d)", errResp.Error.Message, errResp.Error.Code)
 	}
+
+	return nil
+}
+
+// ListMealPlan retrieves meal plan data from Paprika API
+func (c *Client) ListMealPlan(ctx context.Context) (*MealPlanResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/meals", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get meals", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get meals", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get meals: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var mealPlanResp MealPlanResponse
+	if err := json.Unmarshal(rawBytes, &mealPlanResp); err != nil {
+		c.logger.Error("failed to unmarshal meal plan response", "error", err)
+		return nil, err
+	}
+
+	c.logger.Info("Retrieved meal plan", "count", len(mealPlanResp.Result))
+	return &mealPlanResp, nil
+}
+
+// ListGroceries retrieves grocery list data from Paprika API
+func (c *Client) ListGroceries(ctx context.Context) (*GroceryResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/groceries", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get groceries", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get groceries", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get groceries: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var groceryResp GroceryResponse
+	if err := json.Unmarshal(rawBytes, &groceryResp); err != nil {
+		c.logger.Error("failed to unmarshal grocery response", "error", err)
+		return nil, err
+	}
+
+	c.logger.Info("Retrieved groceries", "count", len(groceryResp.Result))
+	return &groceryResp, nil
+}
+
+// ExploreAPI tries common endpoint patterns to discover available APIs
+func (c *Client) ExploreAPI(ctx context.Context) error {
+	endpoints := []string{
+		"https://paprikaapp.com/api/v2/sync/",
+		"https://paprikaapp.com/api/v2/sync/meals",
+		"https://paprikaapp.com/api/v2/sync/menu",
+		"https://paprikaapp.com/api/v2/sync/menus",
+		"https://paprikaapp.com/api/v2/sync/mealplan", 
+		"https://paprikaapp.com/api/v2/sync/groceries",
+		"https://paprikaapp.com/api/v2/sync/grocery",
+		"https://paprikaapp.com/api/v2/sync/pantry",
+		"https://paprikaapp.com/api/v2/sync/categories",
+	}
+
+	// Also try POST requests to see if we can create meal entries
+	mealEndpoints := []string{
+		"https://paprikaapp.com/api/v2/sync/meals",
+		"https://paprikaapp.com/api/v2/sync/meal",
+	}
+
+	// Try GET requests first
+	for _, endpoint := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			continue
+		}
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		rawBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		previewLen := 200
+		if len(rawBytes) < previewLen {
+			previewLen = len(rawBytes)
+		}
+		c.logger.Info("API exploration (GET)", "endpoint", endpoint, "status", resp.StatusCode, "response_length", len(rawBytes), "response", string(rawBytes)[:previewLen])
+	}
+
+	// Try POST requests to meal endpoints
+	for _, endpoint := range mealEndpoints {
+		// Try with empty body first
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("{}"))
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		rawBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		previewLen := 200
+		if len(rawBytes) < previewLen {
+			previewLen = len(rawBytes)
+		}
+		c.logger.Info("API exploration (POST)", "endpoint", endpoint, "status", resp.StatusCode, "response_length", len(rawBytes), "response", string(rawBytes)[:previewLen])
+	}
+
+	return nil
+}
+
+// SaveMealPlan saves a meal plan entry to Paprika API using V1 API with meals array
+func (c *Client) SaveMealPlan(ctx context.Context, meal MealPlan) (*MealPlan, error) {
+	// Generate UUID if not provided
+	if meal.UID == "" {
+		meal.UID = strings.ToUpper(uuid.New().String())
+	}
+
+	// Set required "deleted" field to false
+	meal.Deleted = false
+
+	c.logger.Info("Saving meal using V1 API", "uid", meal.UID, "name", meal.Name, "date", meal.Date, "type", meal.Type)
+
+	// Wrap single meal in array as required by V1 API
+	mealsArray := []MealPlan{meal}
+	mealArrayData, err := json.Marshal(mealsArray)
+	if err != nil {
+		c.logger.Error("failed to marshal meals array", "error", err)
+		return nil, err
+	}
+
+	// Create gzipped data
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(mealArrayData)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	gzippedData := buf.Bytes()
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file", "error", err)
+		return nil, err
+	}
+
+	if _, err := part.Write(gzippedData); err != nil {
+		c.logger.Error("failed to write gzipped meal data", "error", err)
+		return nil, err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer", "error", err)
+		return nil, err
+	}
+
+	// Use V1 API endpoint: /api/v1/sync/meals/ (plural, no UID)
+	endpoint := "https://paprikaapp.com/api/v1/sync/meals/"
+	c.logger.Info("Using V1 API endpoint", "url", endpoint)
+	
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+	
+	// V1 API requires Basic Auth instead of Bearer token
+	credentials := base64.StdEncoding.EncodeToString([]byte(c.username +":" + c.password))
+	req.Header.Set("Authorization", "Basic "+credentials)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to save meal", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	c.logger.Info("SaveMeal V1 API response", "status", resp.StatusCode, "response", string(rawBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to save meal", "status", resp.Status, "response", string(rawBytes))
+		return nil, fmt.Errorf("failed to save meal: %s - %s", resp.Status, string(rawBytes))
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("meal save returned error", "error", err)
+		return nil, err
+	}
+
+	// Trigger sync notification
+	defer c.notify(ctx)
+
+	return &meal, nil
+}
+
+// DeleteMealPlan deletes a meal plan entry from Paprika API
+func (c *Client) DeleteMealPlan(ctx context.Context, uid string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/meal/%s/", uid), nil)
+	if err != nil {
+		c.logger.Error("failed to create delete request", "error", err)
+		return err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to delete meal", "error", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read delete response body", "error", err)
+		return err
+	}
+
+	c.logger.Info("DeleteMeal response", "status", resp.StatusCode, "response", string(rawBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to delete meal", "status", resp.Status, "response", string(rawBytes))
+		return fmt.Errorf("failed to delete meal: %s - %s", resp.Status, string(rawBytes))
+	}
+
+	// Trigger sync notification
+	defer c.notify(ctx)
 
 	return nil
 }
