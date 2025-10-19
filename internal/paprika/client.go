@@ -220,6 +220,7 @@ type GroceryItem struct {
 	Quantity    string `json:"quantity"`
 	AisleUID    string `json:"aisle_uid"`
 	ListUID     string `json:"list_uid"`
+	Deleted     bool   `json:"deleted"` // Soft delete flag (like MealPlan)
 }
 
 type GroceryResponse struct {
@@ -637,80 +638,6 @@ func (c *Client) ListGroceries(ctx context.Context) (*GroceryResponse, error) {
 	return &groceryResp, nil
 }
 
-// ExploreAPI tries common endpoint patterns to discover available APIs
-func (c *Client) ExploreAPI(ctx context.Context) error {
-	endpoints := []string{
-		"https://paprikaapp.com/api/v2/sync/",
-		"https://paprikaapp.com/api/v2/sync/meals",
-		"https://paprikaapp.com/api/v2/sync/menu",
-		"https://paprikaapp.com/api/v2/sync/menus",
-		"https://paprikaapp.com/api/v2/sync/mealplan", 
-		"https://paprikaapp.com/api/v2/sync/groceries",
-		"https://paprikaapp.com/api/v2/sync/grocery",
-		"https://paprikaapp.com/api/v2/sync/pantry",
-		"https://paprikaapp.com/api/v2/sync/categories",
-	}
-
-	// Also try POST requests to see if we can create meal entries
-	mealEndpoints := []string{
-		"https://paprikaapp.com/api/v2/sync/meals",
-		"https://paprikaapp.com/api/v2/sync/meal",
-	}
-
-	// Try GET requests first
-	for _, endpoint := range endpoints {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-		if err != nil {
-			continue
-		}
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		rawBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		previewLen := 200
-		if len(rawBytes) < previewLen {
-			previewLen = len(rawBytes)
-		}
-		c.logger.Info("API exploration (GET)", "endpoint", endpoint, "status", resp.StatusCode, "response_length", len(rawBytes), "response", string(rawBytes)[:previewLen])
-	}
-
-	// Try POST requests to meal endpoints
-	for _, endpoint := range mealEndpoints {
-		// Try with empty body first
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader("{}"))
-		if err != nil {
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := c.client.Do(req)
-		if err != nil {
-			continue
-		}
-
-		rawBytes, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-
-		previewLen := 200
-		if len(rawBytes) < previewLen {
-			previewLen = len(rawBytes)
-		}
-		c.logger.Info("API exploration (POST)", "endpoint", endpoint, "status", resp.StatusCode, "response_length", len(rawBytes), "response", string(rawBytes)[:previewLen])
-	}
-
-	return nil
-}
 
 // SaveMealPlan saves a meal plan entry to Paprika API using V1 API with meals array
 func (c *Client) SaveMealPlan(ctx context.Context, meal MealPlan) (*MealPlan, error) {
@@ -766,15 +693,15 @@ func (c *Client) SaveMealPlan(ctx context.Context, meal MealPlan) (*MealPlan, er
 	// Use V1 API endpoint: /api/v1/sync/meals/ (plural, no UID)
 	endpoint := "https://paprikaapp.com/api/v1/sync/meals/"
 	c.logger.Info("Using V1 API endpoint", "url", endpoint)
-	
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
 	if err != nil {
 		c.logger.Error("failed to create request", "error", err)
 		return nil, err
 	}
-	
+
 	// V1 API requires Basic Auth instead of Bearer token
-	credentials := base64.StdEncoding.EncodeToString([]byte(c.username +":" + c.password))
+	credentials := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.password))
 	req.Header.Set("Authorization", "Basic "+credentials)
 	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
 	req.ContentLength = int64(body.Len())
@@ -810,17 +737,75 @@ func (c *Client) SaveMealPlan(ctx context.Context, meal MealPlan) (*MealPlan, er
 	return &meal, nil
 }
 
-// DeleteMealPlan deletes a meal plan entry from Paprika API
+// DeleteMealPlan deletes a meal plan entry from Paprika API using soft delete
+// Based on Kappari documentation: deletion is via deleted flag, not HTTP DELETE
 func (c *Client) DeleteMealPlan(ctx context.Context, uid string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/meal/%s/", uid), nil)
+	c.logger.Info("Soft-deleting meal plan using Kappari approach", "uid", uid)
+
+	// Create a meal plan with deleted flag set to true
+	meal := MealPlan{
+		UID:     uid,
+		Deleted: true, // Soft delete flag
+	}
+
+	// Use the same SaveMealPlan approach but with deleted=true
+	mealsArray := []MealPlan{meal}
+	mealArrayData, err := json.Marshal(mealsArray)
+	if err != nil {
+		c.logger.Error("failed to marshal delete meal plan", "error", err)
+		return err
+	}
+
+	// Create gzipped data
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(mealArrayData)
+	if err != nil {
+		writer.Close()
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	gzippedData := buf.Bytes()
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file for delete", "error", err)
+		return err
+	}
+
+	if _, err := part.Write(gzippedData); err != nil {
+		c.logger.Error("failed to write gzipped delete data", "error", err)
+		return err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer for delete", "error", err)
+		return err
+	}
+
+	// Use V1 API endpoint with Basic Auth (like SaveMealPlan)
+	endpoint := "https://paprikaapp.com/api/v1/sync/meals/"
+	c.logger.Info("Using V1 API endpoint for soft delete", "url", endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
 	if err != nil {
 		c.logger.Error("failed to create delete request", "error", err)
 		return err
 	}
 
+	// V1 API requires Basic Auth
+	credentials := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.password))
+	req.Header.Set("Authorization", "Basic "+credentials)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
 	resp, err := c.client.Do(req)
 	if err != nil {
-		c.logger.Error("failed to delete meal", "error", err)
+		c.logger.Error("failed to soft delete meal plan", "error", err)
 		return err
 	}
 	defer resp.Body.Close()
@@ -831,11 +816,216 @@ func (c *Client) DeleteMealPlan(ctx context.Context, uid string) error {
 		return err
 	}
 
-	c.logger.Info("DeleteMeal response", "status", resp.StatusCode, "response", string(rawBytes))
+	c.logger.Info("DeleteMealPlan (soft delete) response", "status", resp.StatusCode, "response", string(rawBytes))
 
 	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("failed to delete meal", "status", resp.Status, "response", string(rawBytes))
-		return fmt.Errorf("failed to delete meal: %s - %s", resp.Status, string(rawBytes))
+		c.logger.Error("failed to soft delete meal plan", "status", resp.Status, "response", string(rawBytes))
+		return fmt.Errorf("failed to soft delete meal plan: %s - %s", resp.Status, string(rawBytes))
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("meal plan soft delete returned error", "error", err)
+		return err
+	}
+
+	// Trigger sync notification
+	defer c.notify(ctx)
+
+	return nil
+}
+
+// SaveGroceryItem saves a grocery item to Paprika API using V1 API with groceries array
+func (c *Client) SaveGroceryItem(ctx context.Context, item GroceryItem) (*GroceryItem, error) {
+	// Generate UUID if not provided
+	if item.UID == "" {
+		item.UID = strings.ToUpper(uuid.New().String())
+	}
+
+	// Set default values for required fields
+	if item.OrderFlag == 0 {
+		item.OrderFlag = 0
+	}
+	if item.Name == "" {
+		item.Name = item.Ingredient // Use ingredient as name if not provided
+	}
+
+	c.logger.Info("Saving grocery item using V1 API", "uid", item.UID, "ingredient", item.Ingredient, "aisle", item.Aisle)
+
+	// Wrap single item in array as required by V1 API
+	itemsArray := []GroceryItem{item}
+	itemArrayData, err := json.Marshal(itemsArray)
+	if err != nil {
+		c.logger.Error("failed to marshal grocery items array", "error", err)
+		return nil, err
+	}
+
+	// Create gzipped data
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(itemArrayData)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	gzippedData := buf.Bytes()
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file", "error", err)
+		return nil, err
+	}
+
+	if _, err := part.Write(gzippedData); err != nil {
+		c.logger.Error("failed to write gzipped grocery data", "error", err)
+		return nil, err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer", "error", err)
+		return nil, err
+	}
+
+	// Use V1 API endpoint: /api/v1/sync/groceries/ (plural, no UID)
+	endpoint := "https://paprikaapp.com/api/v1/sync/groceries/"
+	c.logger.Info("Using V1 API endpoint", "url", endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	// V1 API requires Basic Auth instead of Bearer token
+	credentials := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.password))
+	req.Header.Set("Authorization", "Basic "+credentials)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to save grocery item", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	c.logger.Info("SaveGroceryItem V1 API response", "status", resp.StatusCode, "response", string(rawBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to save grocery item", "status", resp.Status, "response", string(rawBytes))
+		return nil, fmt.Errorf("failed to save grocery item: %s - %s", resp.Status, string(rawBytes))
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("grocery item save returned error", "error", err)
+		return nil, err
+	}
+
+	// Trigger sync notification
+	defer c.notify(ctx)
+
+	return &item, nil
+}
+
+// DeleteGroceryItem deletes a grocery item from Paprika API using soft delete
+// Based on Kappari documentation: deletion is "likely via deleted flag" not HTTP DELETE
+func (c *Client) DeleteGroceryItem(ctx context.Context, uid string) error {
+	c.logger.Info("Soft-deleting grocery item using Kappari approach", "uid", uid)
+
+	// Create a grocery item with deleted flag set to true
+	item := GroceryItem{
+		UID:     uid,
+		Deleted: true, // Soft delete flag
+	}
+
+	// Use the same SaveGroceryItem approach but with deleted=true
+	itemsArray := []GroceryItem{item}
+	itemArrayData, err := json.Marshal(itemsArray)
+	if err != nil {
+		c.logger.Error("failed to marshal delete grocery item", "error", err)
+		return err
+	}
+
+	// Create gzipped data
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(itemArrayData)
+	if err != nil {
+		writer.Close()
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+	gzippedData := buf.Bytes()
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file for delete", "error", err)
+		return err
+	}
+
+	if _, err := part.Write(gzippedData); err != nil {
+		c.logger.Error("failed to write gzipped delete data", "error", err)
+		return err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer for delete", "error", err)
+		return err
+	}
+
+	// Try V1 API endpoint with Basic Auth (like SaveGroceryItem)
+	endpoint := "https://paprikaapp.com/api/v1/sync/groceries/"
+	c.logger.Info("Using V1 API endpoint for soft delete", "url", endpoint)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, &body)
+	if err != nil {
+		c.logger.Error("failed to create delete request", "error", err)
+		return err
+	}
+
+	// V1 API requires Basic Auth
+	credentials := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.password))
+	req.Header.Set("Authorization", "Basic "+credentials)
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to soft delete grocery item", "error", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read delete response body", "error", err)
+		return err
+	}
+
+	c.logger.Info("DeleteGroceryItem (soft delete) response", "status", resp.StatusCode, "response", string(rawBytes))
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to soft delete grocery item", "status", resp.Status, "response", string(rawBytes))
+		return fmt.Errorf("failed to soft delete grocery item: %s - %s", resp.Status, string(rawBytes))
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("grocery item soft delete returned error", "error", err)
+		return err
 	}
 
 	// Trigger sync notification

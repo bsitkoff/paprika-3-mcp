@@ -2,7 +2,6 @@ package mcpserver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -75,12 +74,6 @@ func (s *Server) Start() {
 		mcp.WithString("query", mcp.Description("Search term to find recipes (searches name, ingredients, and description). Leave empty to list all recipes."), mcp.DefaultString("")),
 		mcp.WithNumber("limit", mcp.Description("Maximum number of recipes to return"), mcp.DefaultNumber(10)),
 	)
-	exploreAPITool := mcp.NewTool("explore_paprika_api",
-		mcp.WithDescription("Explore Paprika API endpoints to find meal planning and grocery features"),
-	)
-	inspectMealTool := mcp.NewTool("inspect_meal_data",
-		mcp.WithDescription("Inspect the raw structure of existing meals to understand the API format"),
-	)
 	listMealPlanTool := mcp.NewTool("list_meal_plan",
 		mcp.WithDescription("List your meal plan from Paprika showing scheduled meals by date"),
 		mcp.WithString("start_date", mcp.Description("Start date in YYYY-MM-DD format (optional)"), mcp.DefaultString("")),
@@ -101,6 +94,22 @@ func (s *Server) Start() {
 		mcp.WithDescription("Remove a meal from your Paprika meal plan calendar"),
 		mcp.WithString("meal_uid", mcp.Description("UID of the meal to remove (get from list_meal_plan)"), mcp.Required()),
 	)
+	getRecipeTool := mcp.NewTool("get_recipe",
+		mcp.WithDescription("Get full recipe details by UID including ingredients, directions, prep time, and notes"),
+		mcp.WithString("uid", mcp.Description("UID of the recipe to get"), mcp.Required()),
+	)
+	addGroceryItemTool := mcp.NewTool("add_grocery_item",
+		mcp.WithDescription("Add an item to your Paprika grocery/shopping list"),
+		mcp.WithString("ingredient", mcp.Description("The ingredient/item name"), mcp.Required()),
+		mcp.WithString("aisle", mcp.Description("Store aisle where item is located (optional)"), mcp.DefaultString("")),
+		mcp.WithString("quantity", mcp.Description("Quantity needed (optional)"), mcp.DefaultString("")),
+		mcp.WithString("recipe", mcp.Description("Recipe this ingredient is for (optional)"), mcp.DefaultString("")),
+		mcp.WithString("instruction", mcp.Description("Special instructions (optional)"), mcp.DefaultString("")),
+	)
+	removeGroceryItemTool := mcp.NewTool("remove_grocery_item",
+		mcp.WithDescription("Remove an item from your Paprika grocery/shopping list"),
+		mcp.WithString("item_name", mcp.Description("Name of the item to remove (searches ingredient names)"), mcp.Required()),
+	)
 	s.server.AddTools(server.ServerTool{
 		Tool:    createRecipeTool,
 		Handler: s.createRecipe,
@@ -110,9 +119,6 @@ func (s *Server) Start() {
 	}, server.ServerTool{
 		Tool:    searchRecipesTool,
 		Handler: s.searchRecipes,
-	}, server.ServerTool{
-		Tool:    exploreAPITool,
-		Handler: s.exploreAPI,
 	}, server.ServerTool{
 		Tool:    listMealPlanTool,
 		Handler: s.listMealPlan,
@@ -126,8 +132,14 @@ func (s *Server) Start() {
 		Tool:    removeMealTool,
 		Handler: s.removeMealFromPlan,
 	}, server.ServerTool{
-		Tool:    inspectMealTool,
-		Handler: s.inspectMealData,
+		Tool:    getRecipeTool,
+		Handler: s.getRecipe,
+	}, server.ServerTool{
+		Tool:    addGroceryItemTool,
+		Handler: s.addGroceryItem,
+	}, server.ServerTool{
+		Tool:    removeGroceryItemTool,
+		Handler: s.removeGroceryItem,
 	})
 
 	if err := server.ServeStdio(s.server); err != nil {
@@ -359,60 +371,60 @@ func (s *Server) updateRecipe(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	
+
 	// Get search query and limit
 	query := ""
 	if val, ok := req.Params.Arguments["query"].(string); ok {
 		query = strings.ToLower(strings.TrimSpace(val))
 	}
-	
+
 	limit := 10
 	if val, ok := req.Params.Arguments["limit"].(float64); ok {
 		limit = int(val)
 	}
-	
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	
+
 	// Get all recipes
 	recipeList, err := s.paprika3.ListRecipes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list recipes: %w", err)
 	}
-	
+
 	// Fetch full recipe details and filter
 	var matchedRecipes []paprika.Recipe
 	for _, recipeInfo := range recipeList.Result {
 		if len(matchedRecipes) >= limit {
 			break
 		}
-		
+
 		recipe, err := s.paprika3.GetRecipe(ctx, recipeInfo.UID)
 		if err != nil {
 			s.logger.Error("failed to get recipe details", "uid", recipeInfo.UID, "error", err)
 			continue
 		}
-		
+
 		if recipe.InTrash {
 			continue
 		}
-		
+
 		// If no query, include all recipes
 		if query == "" {
 			matchedRecipes = append(matchedRecipes, *recipe)
 			continue
 		}
-		
+
 		// Search in recipe name, ingredients, and description
 		searchText := strings.ToLower(recipe.Name + " " + recipe.Ingredients + " " + recipe.Description)
 		if strings.Contains(searchText, query) {
 			matchedRecipes = append(matchedRecipes, *recipe)
 		}
 	}
-	
+
 	duration := time.Since(start)
 	s.logger.Info("Search completed", "query", query, "matches", len(matchedRecipes), "duration", duration)
-	
+
 	// Format results
 	var resultText strings.Builder
 	if query != "" {
@@ -420,7 +432,7 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 	} else {
 		resultText.WriteString("# All Recipes\n\n")
 	}
-	
+
 	if len(matchedRecipes) == 0 {
 		if query != "" {
 			resultText.WriteString("No recipes found matching your search.\n")
@@ -429,7 +441,7 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	} else {
 		resultText.WriteString(fmt.Sprintf("Found %d recipe(s):\n\n", len(matchedRecipes)))
-		
+
 		for i, recipe := range matchedRecipes {
 			resultText.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, recipe.Name))
 			if recipe.Description != "" {
@@ -455,13 +467,177 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 			resultText.WriteString("\n")
 		}
 	}
-	
+
 	return mcp.NewToolResultText(resultText.String()), nil
+}
+
+func (s *Server) addGroceryItem(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	// Get required parameter
+	ingredient, ok := req.Params.Arguments["ingredient"].(string)
+	if !ok || ingredient == "" {
+		return nil, errors.New("ingredient is required")
+	}
+
+	// Get optional parameters
+	aisle := ""
+	if val, ok := req.Params.Arguments["aisle"].(string); ok {
+		aisle = strings.TrimSpace(val)
+	}
+	quantity := ""
+	if val, ok := req.Params.Arguments["quantity"].(string); ok {
+		quantity = strings.TrimSpace(val)
+	}
+	recipe := ""
+	if val, ok := req.Params.Arguments["recipe"].(string); ok {
+		recipe = strings.TrimSpace(val)
+	}
+	instruction := ""
+	if val, ok := req.Params.Arguments["instruction"].(string); ok {
+		instruction = strings.TrimSpace(val)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Create grocery item
+	item := paprika.GroceryItem{
+		Ingredient:  ingredient,
+		Name:        ingredient, // Use ingredient name as display name
+		Aisle:       aisle,
+		Quantity:    quantity,
+		Recipe:      recipe,
+		Instruction: instruction,
+		Purchased:   false, // New items are not purchased
+		OrderFlag:   0,
+	}
+
+	// Save the grocery item
+	savedItem, err := s.paprika3.SaveGroceryItem(ctx, item)
+	if err != nil {
+		return nil, fmt.Errorf("failed to add grocery item: %w", err)
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Added grocery item", "ingredient", ingredient, "aisle", aisle, "duration", duration)
+
+	// Format result
+	var resultText strings.Builder
+	resultText.WriteString("# Grocery Item Added Successfully\n\n")
+	resultText.WriteString(fmt.Sprintf("Added **%s** to your grocery list\n\n", ingredient))
+	resultText.WriteString(fmt.Sprintf("- **Item**: %s\n", ingredient))
+	if quantity != "" {
+		resultText.WriteString(fmt.Sprintf("- **Quantity**: %s\n", quantity))
+	}
+	if aisle != "" {
+		resultText.WriteString(fmt.Sprintf("- **Aisle**: %s\n", aisle))
+	}
+	if recipe != "" {
+		resultText.WriteString(fmt.Sprintf("- **For Recipe**: %s\n", recipe))
+	}
+	if instruction != "" {
+		resultText.WriteString(fmt.Sprintf("- **Instructions**: %s\n", instruction))
+	}
+	resultText.WriteString(fmt.Sprintf("- **Item ID**: %s\n\n", savedItem.UID))
+	resultText.WriteString("The item has been added to your Paprika grocery list.\n")
+
+	return mcp.NewToolResultText(resultText.String()), nil
+}
+
+func (s *Server) removeGroceryItem(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	// Get item name parameter
+	itemName, ok := req.Params.Arguments["item_name"].(string)
+	if !ok || itemName == "" {
+		return nil, errors.New("item_name is required")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Get current grocery list to find the item
+	groceryResp, err := s.paprika3.ListGroceries(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get grocery list: %w", err)
+	}
+
+	// Find matching items (case-insensitive search)
+	searchTerm := strings.ToLower(strings.TrimSpace(itemName))
+	var matchedItems []paprika.GroceryItem
+	for _, item := range groceryResp.Result {
+		if strings.Contains(strings.ToLower(item.Ingredient), searchTerm) ||
+			strings.Contains(strings.ToLower(item.Name), searchTerm) {
+			matchedItems = append(matchedItems, item)
+		}
+	}
+
+	if len(matchedItems) == 0 {
+		return mcp.NewToolResultText(fmt.Sprintf("# No Items Found\n\nNo grocery items found matching \"%s\". Use list_groceries to see your current list.", itemName)), nil
+	}
+
+	// If multiple matches, remove the first one but inform the user
+	itemToRemove := matchedItems[0]
+	err = s.paprika3.DeleteGroceryItem(ctx, itemToRemove.UID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to remove grocery item: %w", err)
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Removed grocery item", "ingredient", itemToRemove.Ingredient, "uid", itemToRemove.UID, "duration", duration)
+
+	// Format result
+	var resultText strings.Builder
+	resultText.WriteString("# Grocery Item Removed Successfully\n\n")
+	resultText.WriteString(fmt.Sprintf("Removed **%s** from your grocery list.\n\n", itemToRemove.Ingredient))
+
+	if len(matchedItems) > 1 {
+		resultText.WriteString(fmt.Sprintf("Note: Found %d items matching \"%s\". Removed the first match:\n", len(matchedItems), itemName))
+		for i, item := range matchedItems {
+			status := "❌ REMOVED"
+			if i > 0 {
+				status = "⚠️  Still in list"
+			}
+			resultText.WriteString(fmt.Sprintf("- %s %s", status, item.Ingredient))
+			if item.Quantity != "" {
+				resultText.WriteString(fmt.Sprintf(" (%s)", item.Quantity))
+			}
+			resultText.WriteString("\n")
+		}
+		resultText.WriteString("\nTo remove additional items, run the command again.\n")
+	} else {
+		resultText.WriteString("The item has been removed from your Paprika grocery list.\n")
+	}
+
+	return mcp.NewToolResultText(resultText.String()), nil
+}
+
+func (s *Server) getRecipe(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	uid, ok := req.Params.Arguments["uid"].(string)
+	if !ok || uid == "" {
+		return nil, errors.New("uid is required")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	recipe, err := s.paprika3.GetRecipe(ctx, uid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get recipe: %w", err)
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Retrieved recipe", "name", recipe.Name, "uid", recipe.UID, "duration", duration)
+
+	return mcp.NewToolResultText(recipe.ToMarkdown()), nil
 }
 
 func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	
+
 	// Get parameters
 	date, ok := req.Params.Arguments["date"].(string)
 	if !ok || date == "" {
@@ -471,24 +647,24 @@ func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*m
 	if !ok || mealName == "" {
 		return nil, errors.New("meal_name is required")
 	}
-	
+
 	mealType := 2 // Default to dinner
 	if val, ok := req.Params.Arguments["meal_type"].(float64); ok {
 		mealType = int(val)
 	}
-	
+
 	recipeUID := ""
 	if val, ok := req.Params.Arguments["recipe_uid"].(string); ok {
 		recipeUID = strings.TrimSpace(val)
 	}
-	
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	
+
 	// Create meal plan entry with ALL required fields
 	// Format date correctly: "YYYY-MM-DD 00:00:00"
 	formattedDate := date + " 00:00:00"
-	
+
 	meal := paprika.MealPlan{
 		Date:      formattedDate,
 		Name:      mealName,
@@ -496,20 +672,20 @@ func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*m
 		RecipeUID: recipeUID,
 		OrderFlag: 0,
 	}
-	
+
 	// Save the meal plan entry
 	savedMeal, err := s.paprika3.SaveMealPlan(ctx, meal)
 	if err != nil {
 		return nil, fmt.Errorf("failed to add meal to plan: %w", err)
 	}
-	
+
 	duration := time.Since(start)
 	s.logger.Info("Added meal to plan", "date", date, "meal", mealName, "type", mealType, "duration", duration)
-	
+
 	// Format result
 	var resultText strings.Builder
 	resultText.WriteString("# Meal Added Successfully\n\n")
-	
+
 	mealTypeStr := "Dinner"
 	switch mealType {
 	case 0:
@@ -519,7 +695,7 @@ func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*m
 	case 2:
 		mealTypeStr = "Dinner"
 	}
-	
+
 	resultText.WriteString(fmt.Sprintf("Added **%s** as %s on %s\n\n", mealName, mealTypeStr, date))
 	resultText.WriteString(fmt.Sprintf("- **Date**: %s\n", date))
 	resultText.WriteString(fmt.Sprintf("- **Meal**: %s\n", mealName))
@@ -528,101 +704,46 @@ func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*m
 		resultText.WriteString(fmt.Sprintf("- **Recipe ID**: %s\n", recipeUID))
 	}
 	resultText.WriteString(fmt.Sprintf("- **Meal ID**: %s\n\n", savedMeal.UID))
-	
+
 	resultText.WriteString("The meal has been added to your Paprika meal plan calendar.\n")
-	
+
 	return mcp.NewToolResultText(resultText.String()), nil
 }
 
 func (s *Server) removeMealFromPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	
+
 	// Get meal UID parameter
 	mealUID, ok := req.Params.Arguments["meal_uid"].(string)
 	if !ok || mealUID == "" {
 		return nil, errors.New("meal_uid is required")
 	}
-	
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	
+
 	// Delete the meal plan entry
 	err := s.paprika3.DeleteMealPlan(ctx, mealUID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to remove meal from plan: %w", err)
 	}
-	
+
 	duration := time.Since(start)
 	s.logger.Info("Removed meal from plan", "meal_uid", mealUID, "duration", duration)
-	
+
 	// Format result
 	var resultText strings.Builder
 	resultText.WriteString("# Meal Removed Successfully\n\n")
 	resultText.WriteString(fmt.Sprintf("Removed meal with ID **%s** from your meal plan.\n\n", mealUID))
 	resultText.WriteString("The meal has been deleted from your Paprika meal plan calendar.\n")
-	
+
 	return mcp.NewToolResultText(resultText.String()), nil
 }
 
-func (s *Server) inspectMealData(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	start := time.Now()
-	
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	
-	// Get meal plan data
-	mealPlanResp, err := s.paprika3.ListMealPlan(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get meal plan: %w", err)
-	}
-	
-	duration := time.Since(start)
-	s.logger.Info("Retrieved meal plan for inspection", "count", len(mealPlanResp.Result), "duration", duration)
-	
-	// Format results with detailed inspection
-	var resultText strings.Builder
-	resultText.WriteString("# Meal Plan Data Inspection\n\n")
-	
-	if len(mealPlanResp.Result) == 0 {
-		resultText.WriteString("No meals found in your meal plan.\n")
-	} else {
-		resultText.WriteString(fmt.Sprintf("Found %d meal entries. Showing detailed structure:\n\n", len(mealPlanResp.Result)))
-		
-		// Show first few meals with full JSON structure
-		limit := 5
-		if len(mealPlanResp.Result) < limit {
-			limit = len(mealPlanResp.Result)
-		}
-		
-		for i, meal := range mealPlanResp.Result[:limit] {
-			resultText.WriteString(fmt.Sprintf("## Meal %d: %s\n", i+1, meal.Name))
-			resultText.WriteString(fmt.Sprintf("- **Date**: %s\n", meal.Date))
-			resultText.WriteString(fmt.Sprintf("- **UID**: %s\n", meal.UID))
-			resultText.WriteString(fmt.Sprintf("- **Recipe UID**: %s\n", meal.RecipeUID))
-			resultText.WriteString(fmt.Sprintf("- **Type**: %d\n", meal.Type))
-			resultText.WriteString(fmt.Sprintf("- **Order Flag**: %d\n", meal.OrderFlag))
-			resultText.WriteString(fmt.Sprintf("- **Deleted**: %t\n", meal.Deleted))
-			
-			// JSON representation
-			mealJSON, err := json.MarshalIndent(meal, "", "  ")
-			if err == nil {
-				resultText.WriteString("\n**Raw JSON Structure:**\n```json\n")
-				resultText.WriteString(string(mealJSON))
-				resultText.WriteString("\n```\n\n")
-			}
-		}
-		
-		if len(mealPlanResp.Result) > limit {
-			resultText.WriteString(fmt.Sprintf("... and %d more meals\n", len(mealPlanResp.Result)-limit))
-		}
-	}
-	
-	return mcp.NewToolResultText(resultText.String()), nil
-}
 
 func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	
+
 	// Get date filters if provided
 	startDate := ""
 	if val, ok := req.Params.Arguments["start_date"].(string); ok {
@@ -632,16 +753,16 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if val, ok := req.Params.Arguments["end_date"].(string); ok {
 		endDate = strings.TrimSpace(val)
 	}
-	
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	
+
 	// Get meal plan from Paprika
 	mealPlanResp, err := s.paprika3.ListMealPlan(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get meal plan: %w", err)
 	}
-	
+
 	// Filter by date range if specified
 	var filteredMeals []paprika.MealPlan
 	for _, meal := range mealPlanResp.Result {
@@ -653,29 +774,29 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 		filteredMeals = append(filteredMeals, meal)
 	}
-	
+
 	duration := time.Since(start)
 	s.logger.Info("Retrieved meal plan", "total", len(mealPlanResp.Result), "filtered", len(filteredMeals), "duration", duration)
-	
+
 	// Format results
 	var resultText strings.Builder
 	resultText.WriteString("# Meal Plan\n\n")
-	
+
 	if startDate != "" || endDate != "" {
 		resultText.WriteString(fmt.Sprintf("Showing meals from %s to %s\n\n", startDate, endDate))
 	}
-	
+
 	if len(filteredMeals) == 0 {
 		resultText.WriteString("No meals found in the specified date range.\n")
 	} else {
 		resultText.WriteString(fmt.Sprintf("Found %d scheduled meal(s):\n\n", len(filteredMeals)))
-		
+
 		// Group by date
 		mealsByDate := make(map[string][]paprika.MealPlan)
 		for _, meal := range filteredMeals {
 			mealsByDate[meal.Date] = append(mealsByDate[meal.Date], meal)
 		}
-		
+
 		// Sort dates
 		dates := make([]string, 0, len(mealsByDate))
 		for date := range mealsByDate {
@@ -689,11 +810,11 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 				}
 			}
 		}
-		
+
 		for _, date := range dates {
 			meals := mealsByDate[date]
 			resultText.WriteString(fmt.Sprintf("## %s\n", date))
-			
+
 			for _, meal := range meals {
 				mealType := "Meal"
 				switch meal.Type {
@@ -704,7 +825,7 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 				case 0:
 					mealType = "Breakfast"
 				}
-				
+
 				resultText.WriteString(fmt.Sprintf("- **%s**: %s", mealType, meal.Name))
 				if meal.RecipeUID != "" {
 					resultText.WriteString(fmt.Sprintf(" (Recipe ID: %s)", meal.RecipeUID))
@@ -714,28 +835,28 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 			resultText.WriteString("\n")
 		}
 	}
-	
+
 	return mcp.NewToolResultText(resultText.String()), nil
 }
 
 func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
-	
+
 	// Get filter parameter
 	filter := "all"
 	if val, ok := req.Params.Arguments["filter"].(string); ok {
 		filter = strings.ToLower(strings.TrimSpace(val))
 	}
-	
+
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	
+
 	// Get groceries from Paprika
 	groceryResp, err := s.paprika3.ListGroceries(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get groceries: %w", err)
 	}
-	
+
 	// Filter items based on purchase status
 	var filteredItems []paprika.GroceryItem
 	for _, item := range groceryResp.Result {
@@ -752,19 +873,19 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 			filteredItems = append(filteredItems, item)
 		}
 	}
-	
+
 	duration := time.Since(start)
 	s.logger.Info("Retrieved groceries", "total", len(groceryResp.Result), "filtered", len(filteredItems), "filter", filter, "duration", duration)
-	
+
 	// Format results
 	var resultText strings.Builder
 	resultText.WriteString("# Grocery List\n\n")
-	
+
 	if len(filteredItems) == 0 {
 		resultText.WriteString("No grocery items found.\n")
 	} else {
 		resultText.WriteString(fmt.Sprintf("Found %d grocery item(s):\n\n", len(filteredItems)))
-		
+
 		// Group by aisle
 		itemsByAisle := make(map[string][]paprika.GroceryItem)
 		for _, item := range filteredItems {
@@ -774,7 +895,7 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 			}
 			itemsByAisle[aisle] = append(itemsByAisle[aisle], item)
 		}
-		
+
 		// Sort aisles alphabetically
 		aisles := make([]string, 0, len(itemsByAisle))
 		for aisle := range itemsByAisle {
@@ -787,17 +908,17 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 				}
 			}
 		}
-		
+
 		for _, aisle := range aisles {
 			items := itemsByAisle[aisle]
 			resultText.WriteString(fmt.Sprintf("## %s\n", aisle))
-			
+
 			for _, item := range items {
 				status := "☐"
 				if item.Purchased {
 					status = "☑"
 				}
-				
+
 				resultText.WriteString(fmt.Sprintf("%s **%s**", status, item.Ingredient))
 				if item.Quantity != "" {
 					resultText.WriteString(fmt.Sprintf(" (%s)", item.Quantity))
@@ -813,50 +934,7 @@ func (s *Server) listGroceries(ctx context.Context, req mcp.CallToolRequest) (*m
 			resultText.WriteString("\n")
 		}
 	}
-	
+
 	return mcp.NewToolResultText(resultText.String()), nil
 }
 
-func (s *Server) exploreAPI(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	start := time.Now()
-	
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	
-	// First try to get meal plan data
-	mealPlanResp, err := s.paprika3.ListMealPlan(ctx)
-	if err != nil {
-		s.logger.Error("failed to get meal plan data", "error", err)
-	}
-	
-	// Try to get grocery data
-	groceryResp, err := s.paprika3.ListGroceries(ctx)
-	if err != nil {
-		s.logger.Error("failed to get grocery data", "error", err)
-	}
-	
-	// Explore other API endpoints
-	err = s.paprika3.ExploreAPI(ctx)
-	if err != nil {
-		s.logger.Error("failed to explore API", "error", err)
-	}
-	
-	duration := time.Since(start)
-	s.logger.Info("API exploration completed", "duration", duration)
-	
-	var resultText strings.Builder
-	resultText.WriteString("# Paprika API Exploration Results\n\n")
-	resultText.WriteString("Explored various API endpoints to find meal planning and grocery features.\n\n")
-	
-	if mealPlanResp != nil {
-		resultText.WriteString(fmt.Sprintf("## Meal Plan API\nFound %d meal entries\n\n", len(mealPlanResp.Result)))
-	}
-	
-	if groceryResp != nil {
-		resultText.WriteString(fmt.Sprintf("## Grocery API\nFound %d grocery items\n\n", len(groceryResp.Result)))
-	}
-	
-	resultText.WriteString("Check the server logs for detailed exploration results of all attempted endpoints.\n")
-	
-	return mcp.NewToolResultText(resultText.String()), nil
-}
