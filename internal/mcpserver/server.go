@@ -766,10 +766,16 @@ func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mc
 	// Filter by date range if specified
 	var filteredMeals []paprika.MealPlan
 	for _, meal := range mealPlanResp.Result {
-		if startDate != "" && meal.Date < startDate {
+		// Extract date portion (YYYY-MM-DD) from meal.Date which is in format "YYYY-MM-DD HH:MM:SS"
+		mealDate := meal.Date
+		if len(mealDate) >= 10 {
+			mealDate = mealDate[:10]
+		}
+
+		if startDate != "" && mealDate < startDate {
 			continue
 		}
-		if endDate != "" && meal.Date > endDate {
+		if endDate != "" && mealDate > endDate {
 			continue
 		}
 		filteredMeals = append(filteredMeals, meal)
