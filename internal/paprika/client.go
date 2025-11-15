@@ -526,3 +526,266 @@ func isErrorResponse(body []byte) error {
 
 	return nil
 }
+
+// MealType represents the type of meal
+type MealType int
+
+const (
+	Breakfast MealType = 0
+	Lunch     MealType = 1
+	Dinner    MealType = 2
+	Snack     MealType = 3
+)
+
+// String returns the string representation of a MealType
+func (mt MealType) String() string {
+	switch mt {
+	case Breakfast:
+		return "Breakfast"
+	case Lunch:
+		return "Lunch"
+	case Dinner:
+		return "Dinner"
+	case Snack:
+		return "Snack"
+	default:
+		return "Unknown"
+	}
+}
+
+// Meal represents a meal in the meal plan
+type Meal struct {
+	UID       string   `json:"uid"`
+	RecipeUID string   `json:"recipe_uid,omitempty"`
+	Date      string   `json:"date"`
+	Type      MealType `json:"type"`
+	Name      string   `json:"name"`
+	Deleted   bool     `json:"deleted"`
+	OrderFlag int      `json:"order_flag"`
+}
+
+// ListMealPlanResponse represents the response from listing meals
+type ListMealPlanResponse struct {
+	Result []Meal `json:"result"`
+}
+
+// ListMealPlan retrieves all meals from the Paprika API
+func (c *Client) ListMealPlan(ctx context.Context) ([]Meal, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/meals/", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get meals", "error", err)
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get meals", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get meals: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var mealList ListMealPlanResponse
+	if err := json.Unmarshal(rawBytes, &mealList); err != nil {
+		c.logger.Error("failed to unmarshal response", "error", err)
+		return nil, err
+	}
+
+	// Filter out deleted meals
+	meals := make([]Meal, 0)
+	for _, meal := range mealList.Result {
+		if !meal.Deleted {
+			meals = append(meals, meal)
+		}
+	}
+
+	c.logger.Info("found meals", "count", len(meals))
+	return meals, nil
+}
+
+// AddMealToPlan adds a meal to the meal plan
+func (c *Client) AddMealToPlan(ctx context.Context, meal Meal) (*Meal, error) {
+	// Generate a new UUID if one doesn't exist
+	if meal.UID == "" {
+		meal.UID = strings.ToUpper(uuid.New().String())
+	}
+
+	// Ensure the date is in the correct format
+	if meal.Date == "" {
+		return nil, fmt.Errorf("date is required")
+	}
+
+	// Create the meals array (API expects an array)
+	meals := []Meal{meal}
+
+	// Marshal to JSON
+	jsonBytes, err := json.Marshal(meals)
+	if err != nil {
+		return nil, err
+	}
+
+	// Gzip the JSON
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(jsonBytes)
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file", "error", err)
+		return nil, err
+	}
+
+	// Write the gzipped data
+	if _, err := part.Write(buf.Bytes()); err != nil {
+		c.logger.Error("failed to write gzipped data", "error", err)
+		return nil, err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer", "error", err)
+		return nil, err
+	}
+
+	// Create the HTTP request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v2/sync/meals/", &body)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to add meal", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to add meal", "status", resp.Status)
+		return nil, fmt.Errorf("failed to add meal: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("failed to add meal", "error", err)
+		return nil, err
+	}
+
+	defer c.notify(ctx)
+
+	return &meal, nil
+}
+
+// RemoveMealFromPlan removes a meal from the meal plan by marking it as deleted
+func (c *Client) RemoveMealFromPlan(ctx context.Context, mealUID string) error {
+	if mealUID == "" {
+		return fmt.Errorf("meal_uid is required")
+	}
+
+	// Create a deleted meal object
+	meal := Meal{
+		UID:     mealUID,
+		Deleted: true,
+	}
+
+	// Create the meals array
+	meals := []Meal{meal}
+
+	// Marshal to JSON
+	jsonBytes, err := json.Marshal(meals)
+	if err != nil {
+		return err
+	}
+
+	// Gzip the JSON
+	var buf bytes.Buffer
+	writer := gzip.NewWriter(&buf)
+	_, err = writer.Write(jsonBytes)
+	if err != nil {
+		writer.Close()
+		return err
+	}
+	if err := writer.Close(); err != nil {
+		return err
+	}
+
+	// Create multipart form request
+	var body bytes.Buffer
+	multipartWriter := multipart.NewWriter(&body)
+	part, err := multipartWriter.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file", "error", err)
+		return err
+	}
+
+	// Write the gzipped data
+	if _, err := part.Write(buf.Bytes()); err != nil {
+		c.logger.Error("failed to write gzipped data", "error", err)
+		return err
+	}
+	if err := multipartWriter.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer", "error", err)
+		return err
+	}
+
+	// Create the HTTP request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://paprikaapp.com/api/v2/sync/meals/", &body)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return err
+	}
+	req.Header.Set("Content-Type", multipartWriter.FormDataContentType())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to remove meal", "error", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to remove meal", "status", resp.Status)
+		return fmt.Errorf("failed to remove meal: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return err
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("failed to remove meal", "error", err)
+		return err
+	}
+
+	defer c.notify(ctx)
+
+	return nil
+}

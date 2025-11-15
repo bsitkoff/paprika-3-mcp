@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -68,12 +70,36 @@ func (s *Server) Start() {
 		mcp.WithString("cook_time", mcp.Description("The cook time for the recipe"), mcp.Required()),
 		mcp.WithString("difficulty", mcp.Description("The difficulty of the recipe"), mcp.Required()),
 	)
+	listMealPlanTool := mcp.NewTool("list_meal_plan",
+		mcp.WithDescription("List all meals in the Paprika meal plan"),
+	)
+	addMealToPlanTool := mcp.NewTool("add_meal_to_plan",
+		mcp.WithDescription("Add a meal to the Paprika meal plan"),
+		mcp.WithString("name", mcp.Description("The name of the meal"), mcp.Required()),
+		mcp.WithString("date", mcp.Description("The date for the meal in format 'YYYY-MM-DD HH:MM:SS'"), mcp.Required()),
+		mcp.WithNumber("type", mcp.Description("The type of meal: 0=Breakfast, 1=Lunch, 2=Dinner, 3=Snack"), mcp.Required()),
+		mcp.WithString("recipe_uid", mcp.Description("Optional: The UID of the recipe to associate with this meal"), mcp.DefaultString("")),
+	)
+	removeMealFromPlanTool := mcp.NewTool("remove_meal_from_plan",
+		mcp.WithDescription("Remove a meal from the Paprika meal plan using the meal UID"),
+		mcp.WithString("meal_uid", mcp.Description("The UID of the meal to remove (obtained from list_meal_plan)"), mcp.Required()),
+	)
+
 	s.server.AddTools(server.ServerTool{
 		Tool:    createRecipeTool,
 		Handler: s.createRecipe,
 	}, server.ServerTool{
 		Tool:    updateRecipeTool,
 		Handler: s.updateRecipe,
+	}, server.ServerTool{
+		Tool:    listMealPlanTool,
+		Handler: s.listMealPlan,
+	}, server.ServerTool{
+		Tool:    addMealToPlanTool,
+		Handler: s.addMealToPlan,
+	}, server.ServerTool{
+		Tool:    removeMealFromPlanTool,
+		Handler: s.removeMealFromPlan,
 	})
 
 	if err := server.ServeStdio(s.server); err != nil {
@@ -281,4 +307,121 @@ func (s *Server) updateRecipe(ctx context.Context, req mcp.CallToolRequest) (*mc
 		MIMEType: "text/markdown",
 		Text:     recipe.ToMarkdown(),
 	}), nil
+}
+
+func (s *Server) listMealPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	meals, err := s.paprika3.ListMealPlan(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Format the meal plan as markdown
+	var sb strings.Builder
+	sb.WriteString("# Meal Plan\n\n")
+
+	if len(meals) == 0 {
+		sb.WriteString("No meals scheduled.\n")
+	} else {
+		// Group meals by date
+		mealsByDate := make(map[string][]paprika.Meal)
+		for _, meal := range meals {
+			dateKey := meal.Date[:10] // Extract YYYY-MM-DD
+			mealsByDate[dateKey] = append(mealsByDate[dateKey], meal)
+		}
+
+		// Sort dates
+		dates := make([]string, 0, len(mealsByDate))
+		for date := range mealsByDate {
+			dates = append(dates, date)
+		}
+		sort.Strings(dates)
+
+		// Output meals by date
+		for _, date := range dates {
+			sb.WriteString(fmt.Sprintf("## %s\n\n", date))
+			for _, meal := range mealsByDate[date] {
+				sb.WriteString(fmt.Sprintf("- **%s**: %s\n", meal.Type.String(), meal.Name))
+				sb.WriteString(fmt.Sprintf("  - Meal UID: `%s`\n", meal.UID))
+				if meal.RecipeUID != "" {
+					sb.WriteString(fmt.Sprintf("  - Recipe UID: `%s`\n", meal.RecipeUID))
+				} else {
+					sb.WriteString("  - Recipe UID: (none - free text meal)\n")
+				}
+				sb.WriteString("\n")
+			}
+		}
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Listed meal plan", "count", len(meals), "duration", duration)
+
+	return mcp.NewToolResultText(sb.String()), nil
+}
+
+func (s *Server) addMealToPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	name, ok := req.Params.Arguments["name"].(string)
+	if !ok || len(name) == 0 {
+		return nil, errors.New("name is required")
+	}
+	date, ok := req.Params.Arguments["date"].(string)
+	if !ok || len(date) == 0 {
+		return nil, errors.New("date is required")
+	}
+	mealTypeFloat, ok := req.Params.Arguments["type"].(float64)
+	if !ok {
+		return nil, errors.New("type is required")
+	}
+	mealType := paprika.MealType(int(mealTypeFloat))
+	recipeUID := ""
+	if uid, ok := req.Params.Arguments["recipe_uid"].(string); ok {
+		recipeUID = uid
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	meal, err := s.paprika3.AddMealToPlan(ctx, paprika.Meal{
+		Name:      name,
+		Date:      date,
+		Type:      mealType,
+		RecipeUID: recipeUID,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Added meal to plan", "name", meal.Name, "uid", meal.UID, "duration", duration)
+
+	result := fmt.Sprintf("Successfully added meal: %s on %s (%s)\nMeal UID: %s", meal.Name, date, meal.Type.String(), meal.UID)
+	if meal.RecipeUID != "" {
+		result += fmt.Sprintf("\nRecipe UID: %s", meal.RecipeUID)
+	}
+
+	return mcp.NewToolResultText(result), nil
+}
+
+func (s *Server) removeMealFromPlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+	mealUID, ok := req.Params.Arguments["meal_uid"].(string)
+	if !ok || len(mealUID) == 0 {
+		return nil, errors.New("meal_uid is required")
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	if err := s.paprika3.RemoveMealFromPlan(ctx, mealUID); err != nil {
+		return nil, err
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Removed meal from plan", "meal_uid", mealUID, "duration", duration)
+
+	return mcp.NewToolResultText(fmt.Sprintf("Successfully removed meal with UID: %s", mealUID)), nil
 }
